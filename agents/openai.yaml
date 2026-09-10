@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dynamic Workflows"
+  short_description: "Run phased Codex multi-agent workflows"
+  default_prompt: "Use $dynamic-workflows to fan this task out across Codex agents and synthesize the result."
