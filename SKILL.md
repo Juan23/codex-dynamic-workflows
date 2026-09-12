@@ -6,6 +6,20 @@ description: Design and execute bounded, phased Codex multi-agent workflows with
 # Dynamic Workflows
 
 Turn a rough request into a small orchestration program, execute it with Codex's native collaboration tools, and synthesize an evidence-backed result.
+## Roles and providers
+
+The current Codex model is the orchestrator; Luna is the primary executor and a fresh Luna performs the final review. Antigravity (`agy`) is an opt-in external worker for bounded investigation, checks, or critique. A secondary `agy` implementation requires explicit user authorization.
+
+- The orchestrator owns scope, phases, invariants, integration, conflict resolution, and acceptance. Workers cannot delegate recursively.
+- Use native Codex collaboration for Luna implementation and fresh Luna review. A standalone runner returns `blocked` when that host capability is unavailable.
+- Use `agy -p ... --output-format json` through [`runner/provider_runner.py`](runner/provider_runner.py). It uses cached Antigravity subscription credentials and keeps permission enforcement enabled.
+- Every provider result has one terminal status: `succeeded`, `blocked`, `error`, or `canceled`, plus compact evidence, usage when supplied, and a full-log artifact pointer.
+
+Run `python -m runner.provider_runner capabilities --provider agy` before dispatch. For a bounded external task, use `python -m runner.provider_runner run --provider agy --prompt "..." --timeout 120 --retries 1`. Authentication, unavailable binaries, permission denials, and unsupported native capabilities remain `blocked`.
+
+## Context diet
+
+Start each worker with only the objective, owned paths or questions, invariants, proof required, and stop condition. Workers discover repository context themselves. Pass compact structured results and proof pointers between phases. Retry only the failed task with the missing authoritative fact and its first failure. Keep a root ledger of phase, worker, status, artifact, and unresolved gap. Load references progressively: read [references/workflow-language.md](references/workflow-language.md) for DSL shape and [references/provider-contract.md](references/provider-contract.md) when selecting a backend.
 
 ## Guardrails
 
