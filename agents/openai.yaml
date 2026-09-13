@@ -1,4 +1,4 @@
 interface:
   display_name: "Dynamic Workflows"
-  short_description: "Run phased Codex multi-agent workflows"
-  default_prompt: "Use $dynamic-workflows to fan this task out across Codex agents and synthesize the result."
+  short_description: "Coordinate Luna and Antigravity with lean context"
+  default_prompt: "Use $dynamic-workflows to coordinate Luna and Antigravity for this task with minimal context and independent review."
