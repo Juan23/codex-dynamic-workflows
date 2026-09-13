@@ -1,83 +1,53 @@
 # Workflow language
 
-Use this JavaScript-shaped DSL as an orchestration artifact. Codex interprets it and calls native collaboration tools; do not execute it with Node.
+This JavaScript-shaped notation is an orchestration artifact interpreted by the current chat model. It is not executable JavaScript, a Node runtime, or a sandbox. Only save a requested reusable workflow, under `.codex/workflows/<name>.workflow.js`.
 
-## Required shape
+## Semantics
 
-```js
-export const meta = {
-  name: "inspect_project",
-  description: "Inspect the project and synthesize its architecture",
-  phases: [{ title: "Scan" }, { title: "Analyze" }],
-};
-
-phase("Scan");
-const scans = await parallel([
-  () => agent("Map entry points and module boundaries.", {
-    label: "module map",
-    scope: ["src"],
-    mode: "read-only",
-    output: { summary: "string", evidence: "array" },
-  }),
-  () => agent("Map tests, build commands, and quality gates.", {
-    label: "test map",
-    scope: ["package.json", "tests"],
-    mode: "read-only",
-    output: { summary: "string", evidence: "array" },
-  }),
-]);
-
-phase("Analyze");
-const result = await agent("Synthesize the supplied scans; flag disagreements.", {
-  label: "synthesis",
-  input: scans,
-  mode: "read-only",
-  output: { verdict: "string", findings: "array", gaps: "array" },
-});
-
-return { ok: result !== null, result };
-```
-
-## Globals
-
-| Global | Semantics |
+| Form | Meaning |
 | --- | --- |
-| `agent(prompt, opts)` | Run one isolated, bounded subagent and return its result or `null`. |
-| `parallel(thunks)` | Run independent agent thunks concurrently and preserve result order. |
-| `pipeline(items, ...stages)` | Fan items out while keeping stages sequential per item. |
-| `phase(title)` | Mark a user-visible execution boundary. |
-| `log(message)` | Emit a concise progress event. |
-| `args` | Immutable JSON-compatible workflow input. |
-| `budget` | Logical limits for agents, phases, retries, and requested token budget. |
+| `phase(title)` | Move the corresponding plan phase to in progress. |
+| `agent(prompt, opts)` | Dispatch one bounded worker via its backend and validate its result. |
+| `parallel(thunks)` | Dispatch independent tasks within the shared worker limit; preserve result order. |
+| `pipeline(items, ...stages)` | Keep stages sequential per item; stop failed items' dependent stages. |
+| `log(message)` | Send a meaningful progress update. |
+| `args`, `budget` | Immutable task inputs and explicit worker/phase/retry limits. Token limits require actual host support. |
+
+Every agent returns a structured status and evidence or an explicit failure; legacy `null` results are normalized to `error` before dependent dispatch. Fresh tasks are the default. A stage consumes only its required upstream result or artifact pointers.
 
 ## Agent options
 
-- `label`: unique two-to-five-word task label.
-- `scope`: exact files, directories, sources, or questions owned by the worker.
-- `mode`: `read-only` or `workspace-write`; default to `read-only`.
-- `input`: JSON-compatible upstream results required by this task.
-- `output`: required JSON-compatible result shape or named Markdown headings.
-- `model` and `effort`: set only when the user or active harness explicitly permits an override.
-- `isolation`: request a worktree only when independent edits require it and the harness supports it.
+- Identity: `label`, `role` (`implement`, `investigate`, `verify`, `review`), `backend` (`codex-native`, `agy`), and explicit `model` selected under the provider contract; `effort` only when supported.
+- Ownership: `scope`, `worktree`, `base`, `mode` (`read-only`, `workspace-write`), and required isolation. Mode describes a requirement, not enforcement; the adapter must meet it or return `blocked`.
+- Context: `input`, `invariants`, `acceptance`, `output` shape, and `stopWhen`. Apply [context routing](context-routing.md), rather than serializing the parent context.
+- Bounds: `timeoutSeconds`, `retryLimit` (at most one), and an artifact directory unique to the task. The orchestrator enforces shared concurrency and cancellation.
 
-## Determinism
-
-Keep saved workflows reproducible. Disallow imports, `require`, filesystem or network calls, `Date`, randomness, environment variables, subprocesses, and computed metadata. Put all external information in `args` or agent prompts.
-
-## Pipeline example
+Example, interpreted rather than run:
 
 ```js
+export const meta = {
+  name: "bounded_fix",
+  phases: [{ title: "Implement" }, { title: "Review" }],
+};
+phase("Implement");
+const change = await agent(args.task, {
+  label: "implement fix", role: "implement", backend: "codex-native",
+  model: "gpt-5.6-luna", mode: "workspace-write",
+  worktree: args.worktree, base: args.base, scope: args.scope,
+  acceptance: args.acceptance,
+});
+if (change.status !== "succeeded") return change;
+// The orchestrator integrates before providing the final head to review.
 phase("Review");
-const reviewed = await pipeline(
-  args.files,
-  (file) => agent(`Inspect ${file}`, { label: `inspect ${file}`, scope: [file] }),
-  (finding, file) => finding === null ? null : agent(
-    `Verify this finding for ${file}`,
-    { label: `verify ${file}`, scope: [file], input: finding },
-  ),
-);
-
-return reviewed;
+const review = await agent("Review the complete integrated diff independently.", {
+  label: "final review", role: "review", backend: "codex-native",
+  model: "gpt-5.6-luna", mode: "read-only",
+  input: { base: args.base, head: args.integratedHead, proof: change.evidence },
+  acceptance: args.acceptance,
+});
+return { change, review };
 ```
 
-Treat each stage as a fresh task by default. Pass only the prior result and original item needed by the next stage.
+External workers use `backend: "agy"` and a discovered, pinned model. The orchestrator translates the task into one Python runner invocation from [provider-contract.md](provider-contract.md); the DSL itself never launches subprocesses.
+
+Saved artifacts contain no imports, filesystem/network calls, environment reads, current time, randomness, or hidden side effects. These belong to verified backend execution, with their resulting facts passed through `args` or the minimal task contract.

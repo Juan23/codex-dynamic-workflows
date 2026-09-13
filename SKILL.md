@@ -1,83 +1,45 @@
 ---
 name: dynamic-workflows
-description: Design and execute bounded, phased Codex multi-agent workflows with agent, parallel, pipeline, phase, structured-result, cancellation, and synthesis semantics. Use only when the user explicitly asks for a dynamic workflow, workflow script, swarm, fan-out, parallel agents, subagents, or multi-agent orchestration; do not auto-trigger merely because a task is large or complex.
+description: Orchestrate bounded Luna and Antigravity workers with minimal context. Use when the user requests dynamic workflows, subagents, or multi-agent orchestration.
 ---
 
 # Dynamic Workflows
 
-Turn a rough request into a small orchestration program, execute it with Codex's native collaboration tools, and synthesize an evidence-backed result.
-## Roles and providers
+The model in the current chat stays the orchestrator. Luna is the primary executor; Antigravity (`agy`) handles useful supporting work. This skill is a candidate replacement for JM, not an installer or a global workflow toggle.
 
-The current Codex model is the orchestrator; Luna is the primary executor and a fresh Luna performs the final review. Antigravity (`agy`) is an opt-in external worker for bounded investigation, checks, or critique. A secondary `agy` implementation requires explicit user authorization.
+## Start
 
-- The orchestrator owns scope, phases, invariants, integration, conflict resolution, and acceptance. Workers cannot delegate recursively.
-- Use native Codex collaboration for Luna implementation and fresh Luna review. A standalone runner returns `blocked` when that host capability is unavailable.
-- Use `agy -p ... --output-format json` through [`runner/provider_runner.py`](runner/provider_runner.py). It uses cached Antigravity subscription credentials and keeps permission enforcement enabled.
-- Every provider result has one terminal status: `succeeded`, `blocked`, `error`, or `canceled`, plus compact evidence, usage when supplied, and a full-log artifact pointer.
+1. Establish the objective, owned scope, invariants, acceptance evidence, and stop conditions. Honor the active repository workflow; when JM remains mandatory, use it and treat this skill as design material until the user explicitly changes that policy. Installing or reading this skill changes no other skill, setting, or sentinel.
+2. Read [context-routing.md](references/context-routing.md) once for the minimal handoff and root ledger. This policy is always on within this workflow and has no dependency on JM or its context-diet toggle.
+3. Choose the smallest useful graph using the roles below. Read [provider-contract.md](references/provider-contract.md) only for the backends being dispatched. If saving or interpreting a workflow artifact, also read [workflow-language.md](references/workflow-language.md).
+4. Publish one plan item per phase, with one in progress. Dispatch bounded tasks, validate their evidence, integrate, then obtain fresh Luna review of the complete integrated change.
+5. Accept only after relevant checks and final review succeed, or report the exact remaining blocker. Return the result and evidence gaps; the orchestrator owns the final answer.
 
-Run `python -m runner.provider_runner capabilities --provider agy` before dispatch. For a bounded external task, use `python -m runner.provider_runner run --provider agy --prompt "..." --timeout 120 --retries 1`. Authentication, unavailable binaries, permission denials, and unsupported native capabilities remain `blocked`.
+## Roles
 
-## Context diet
+| Role | Default worker | Boundary |
+| --- | --- | --- |
+| Orchestration | Current chat model | Scope, decisions, dispatch, integration, conflicts, acceptance |
+| Implementation and repair | Luna | One owned implementation unit and its proof |
+| Investigation and verification | Antigravity | Bounded reproduction, source research, check execution, or critique when it saves useful work |
+| Final review | Fresh Luna | Independently read the complete current diff and verify acceptance evidence |
 
-Start each worker with only the objective, owned paths or questions, invariants, proof required, and stop condition. Workers discover repository context themselves. Pass compact structured results and proof pointers between phases. Retry only the failed task with the missing authoritative fact and its first failure. Keep a root ledger of phase, worker, status, artifact, and unresolved gap. Load references progressively: read [references/workflow-language.md](references/workflow-language.md) for DSL shape and [references/provider-contract.md](references/provider-contract.md) when selecting a backend.
+Role, backend, and model are distinct. Use `codex-native` for Luna and `agy` for the external CLI. Discover actual capabilities before promising delegation. A different chat host remains the orchestrator but must expose a verified Luna adapter; the bundled Python runner cannot supply native Luna. Report a missing adapter rather than silently changing models.
 
-## Guardrails
+Route substantial supporting tasks to Antigravity by default when available. Skip redundant worker stages for tiny changes. Secondary Antigravity implementation is an explicit task-level routing choice, with its own write scope; Luna remains the default. An Antigravity critique does not replace fresh Luna final review.
 
-- Treat explicit invocation as authorization to delegate only the work already in scope.
-- Keep the root agent responsible for scope, acceptance criteria, integration, and the final answer.
-- Use collaboration subagents, not user-visible Codex tasks, unless the user explicitly requests separate tasks.
-- Keep at most five subagents active concurrently; the root agent occupies the remaining slot.
-- Preserve user changes and assign non-overlapping write scopes. Use read-only agents for research and review.
-- Never claim that the workflow artifact is executed by Node or securely sandboxed. Codex interprets it and maps it to native tools.
-- Never claim cross-session resume or exact token accounting. Report these as unavailable unless the current harness proves otherwise.
+## Execution boundaries
 
-## Run a workflow
+- Only the orchestrator dispatches workers. Each worker receives its role and ownership boundary and returns directly; it does not recursively delegate or load the parent orchestration policy.
+- Bound parallelism by the host's remaining slots and external process limit, with at most five active workers total by default. Run parallel branches only when their inputs and ownership are independent. Use isolated worktrees for concurrent writers; coordinate shared resources separately.
+- Integrate only completed worker changes while preserving existing user work. Resolve conflicts before review. Any subsequent edit invalidates the review and requires another fresh Luna review of the final diff.
+- Treat a process completion status separately from task acceptance. Required proof must show the requested outcome on the reviewed revision. A missing or denied check leaves that acceptance item unverified.
+- Honor enabled documentation/evidence policies without expanding into unrelated cleanup. No cross-session resume, enforced sandbox, exact token accounting, or savings claim without supporting runtime evidence.
 
-1. Define a contract with the objective, in-scope inputs, exclusions, deliverables, evidence required, and stop conditions.
-2. Choose the smallest useful graph. Prefer two or three workers and one synthesis pass; use five workers only when the tracks are independent.
-3. Draft the workflow using the language in [references/workflow-language.md](references/workflow-language.md). Keep it internal unless the user asks to see, save, or reuse it.
-4. Publish a plan with one item per phase and exactly one phase in progress.
-5. Execute each phase using the mappings below. Send a concise commentary update at phase boundaries.
-6. Validate every worker result against its contract. Retry a malformed result once with the missing fields named; otherwise record `null` and continue when safe.
-7. Run an independent synthesis or verification task when two or more worker results affect the conclusion.
-8. Return the requested deliverable plus a compact status for each requested outcome. Name any unverified gap.
+## Failure and cancellation
 
-## Map the workflow language to Codex
+A failed branch stops only its dependent stages. Keep independent branches running when their contracts remain valid. Return explicit `blocked`, `error`, or `canceled` results instead of losing failure details as `null`.
 
-- `phase(title)`: update the plan so the named phase is in progress.
-- `agent(prompt, opts)`: spawn one bounded subagent with a unique task name and the contract in `opts`.
-- `parallel(thunks)`: spawn independent thunks without awaiting between them, then wait until every branch completes or needs attention. Preserve input order in the result array.
-- `pipeline(items, ...stages)`: process items concurrently, but run stages sequentially for each item. Use a fresh agent per stage unless continuity is part of the contract.
-- `log(message)`: send one short progress update; do not narrate unchanged waits.
-- `args`: treat the user's supplied JSON-compatible value as immutable workflow input.
-- `budget`: enforce explicit limits through worker count, phase count, retry count, and any harness goal budget the user requested.
+For a repairable failure, give the same worker one focused retry using the context-routing contract. Inspect partial changes before retrying execution; never automatically replay a task that may have written files. A repeated failure returns to the orchestrator for a decision. Authentication, quota, unsupported capabilities, and missing authorization are blockers, not retry loops. Model or billing fallback is a visible orchestrator decision within the user's authorization.
 
-## Construct every agent task
-
-Include these fields in the subagent message:
-
-```text
-Objective: <one bounded outcome>
-Scope: <paths, sources, or questions owned by this worker>
-Inputs: <only the context required to work independently>
-Constraints: <read-only or exact write boundary; safety limits>
-Deliverable: <required headings or JSON-compatible shape>
-Evidence: <commands, files, lines, URLs, or outputs that must support claims>
-Stop when: <completion condition or blocker condition>
-```
-
-Ask workers to return results, not instructions for the root agent to rediscover their work. Never delegate the final user-facing answer.
-
-## Handle failures and cancellation
-
-- On an agent failure, capture the location, cause, and available evidence; represent its value as `null`.
-- In `parallel`, allow independent branches to finish after one branch fails.
-- In `pipeline`, stop only the failed item's remaining stages unless its failure invalidates the whole workflow.
-- When the user cancels or replaces the request, interrupt every active subagent and mark unfinished branches skipped.
-- After three repeated failures, stop retrying and name the doubtful assumption.
-
-## Finish the run
-
-Report the result first. Then show a compact phase/agent status only when it helps the user verify the work. Distinguish performed actions, verified outcomes, failures, and unverified claims.
-
-Save a reusable workflow only when requested. Write it under `.codex/workflows/<short-name>.workflow.js` and keep it deterministic: no imports, filesystem access, network access, current time, randomness, or hidden side effects.
+On cancellation, interrupt every native worker and terminate owned external process trees, preserving available logs and marking unfinished branches canceled. A restart is a fresh dispatch unless the host proves usable session state.

@@ -1,25 +1,18 @@
-"""Bounded provider adapters for dynamic-workflows.
-
-The workflow DSL remains declarative: this module runs one already-dispatched
-task and returns evidence. It never interprets workflow JavaScript or delegates
-to another worker.
-"""
-
+"""Run one external worker. The orchestrator interprets the workflow DSL."""
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
-import time
-from dataclasses import asdict, dataclass
+import uuid
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
-
-
-TERMINAL = {"succeeded", "blocked", "error", "canceled"}
 
 
 @dataclass
@@ -28,154 +21,220 @@ class Outcome:
     provider: str
     model: str | None
     summary: str
-    evidence: list[str]
+    evidence: list[str] = field(default_factory=list)
     log_path: str | None = None
     usage: dict[str, Any] | None = None
-    attempts: int = 1
+    attempts: int = 0
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self):
         return asdict(self)
 
 
-def _log(artifact_dir: Path, provider: str, payload: dict[str, Any]) -> str:
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    path = artifact_dir / f"{provider}-{int(time.time() * 1000)}.json"
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
-    return str(path)
-
-
-def _capabilities(provider: str, model: str | None) -> dict[str, Any]:
-    if provider == "codex-native":
-        return {
-            "provider": provider,
-            "available": False,
-            "reason": "native collaboration must be supplied by the Codex host",
-            "model": model or "gpt-5.6-luna",
-            "auth": "host-managed",
-        }
+def _executable():
     configured = os.environ.get("AGY_BIN", "agy")
-    executable = shutil.which(configured) or (configured if Path(configured).is_file() else None)
-    return {
-        "provider": provider,
-        "available": executable is not None,
-        "executable": executable,
-        "model": model,
-        "auth": "cached agy credentials; checked by execution",
-    }
+    located = shutil.which(configured)
+    if not located and Path(configured).is_file():
+        located = str(Path(configured).resolve())
+    return located
 
 
-def capabilities(provider: str, model: str | None = None) -> dict[str, Any]:
-    if provider not in {"codex-native", "agy"}:
-        raise ValueError(f"unsupported provider: {provider}")
-    return _capabilities(provider, model)
+def _prefix(executable):
+    return [sys.executable, executable] if executable.endswith((".py", ".pyw")) else [executable]
 
 
-def run_task(
-    *,
-    provider: str,
-    prompt: str,
-    model: str | None = None,
-    timeout: float = 120,
-    retries: int = 0,
-    artifact_dir: str | os.PathLike[str] = ".workflow-artifacts",
-    cwd: str | os.PathLike[str] | None = None,
-    cancel: bool = False,
-    dangerously_skip_permissions: bool = False,
-) -> Outcome:
-    """Run one bounded task; retry only transient process failures."""
-    if not prompt.strip():
-        raise ValueError("prompt must be non-empty")
-    if timeout <= 0 or retries < 0:
-        raise ValueError("timeout must be positive and retries cannot be negative")
-    if cancel:
-        return Outcome("canceled", provider, model, "canceled before dispatch", [], attempts=0)
+def _spawn_options():
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    return {"start_new_session": True}
+
+
+def _stop_tree(process):
+    """Stop owned descendants as well as their parent; return cleanup evidence."""
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=3)
+                return "parent terminated or exited; descendant cleanup unverified"
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=3)
+        return "process-tree termination completed"
+    except ProcessLookupError:
+        return "process already exited; descendant cleanup unverified"
+    except (OSError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            process.kill()
+        return "termination attempted; process-tree cleanup unverified"
+
+
+def capabilities(provider, model=None):
     if provider == "codex-native":
-        return Outcome(
-            "blocked", provider, model or "gpt-5.6-luna",
-            "native Codex Luna capability is unavailable to this standalone runner",
-            ["host must dispatch via native spawn_agent(model=gpt-5.6-luna)"],
-            attempts=0,
-        )
+        return {"provider": provider, "available": False,
+                "reason": "Luna requires the host native collaboration tool; this runner cannot supply it"}
     if provider != "agy":
-        raise ValueError(f"unsupported provider: {provider}")
+        raise ValueError("unsupported provider")
+    executable = _executable()
+    return {"provider": provider, "available": bool(executable), "executable": executable,
+            "model": model, "auth": "unverified until an account-backed run succeeds",
+            "read_only_enforced": False, "modes": ["workspace-write"],
+            "note": "Executable discovery only. Check installed --help and models before first use."}
+
+
+def _blocked_diagnostic(text):
+    return any(term in text.lower() for term in (
+        "authentication", "credential", "sign in", "login", "log in", "quota",
+        "rate limit", "rate_limit", "permission", "soft-denied", "soft denied",
+        "approval", "access denied", "not allowed", "unknown model", "model not found",
+    ))
+
+
+def _account_blocker():
+    # Do not change auth or send requests through a user-configured API-key provider.
+    settings = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
+    try:
+        config = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
+        if not isinstance(config, dict):
+            return "agy settings are not a JSON object"
+        if config.get("modelProvider", "antigravity") not in ("antigravity", None, ""):
+            return "agy uses a custom/API model provider; configure subscription account auth explicitly"
+        if config.get("useG1Credits") is True:
+            return "agy credit overage is enabled; disable it explicitly for subscription-quota-only execution"
+    except (OSError, ValueError):
+        return "cannot validate agy account settings"
+    return None
+
+
+def run_task(*, provider, prompt, model=None, timeout=120, retries=0,
+             artifact_dir=".workflow-artifacts", cwd=None, cancel=False,
+             dangerously_skip_permissions=False, mode="read-only"):
+    if provider not in ("codex-native", "agy"):
+        raise ValueError("unsupported provider")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt must be non-empty text")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be finite and positive")
+    result = Outcome("blocked", provider, model, "")
+    if cancel:
+        result.status, result.summary = "canceled", "canceled before dispatch"
+        return result
+    if provider == "codex-native":
+        result.summary = "dispatch Luna with the host native collaboration tool"
+        return result
+    if retries != 0:
+        result.summary = "automatic task replay is disabled; the orchestrator owns focused retries"
+        return result
     if dangerously_skip_permissions:
-        return Outcome("blocked", provider, model, "permission bypass is not supported", [], attempts=0)
+        result.summary = "permission bypass is unsupported"
+        return result
+    if mode != "workspace-write":
+        result.summary = "this adapter cannot enforce read-only execution; a plan prompt is not a sandbox"
+        return result
+    if not model or not isinstance(model, str):
+        result.summary = "pin a model from the installed agy model list"
+        return result
+    if cwd is None or not Path(cwd).is_dir():
+        result.summary = "provide an existing task workspace with --cwd"
+        return result
+    executable = _executable()
+    if not executable:
+        result.summary = "agy executable unavailable"
+        return result
+    account_blocker = _account_blocker()
+    if account_blocker:
+        result.summary = account_blocker
+        return result
 
-    configured = os.environ.get("AGY_BIN", "agy")
-    executable = shutil.which(configured) or (configured if Path(configured).is_file() else None)
-    if executable is None:
-        return Outcome("blocked", provider, model, "agy executable is unavailable", [], attempts=0)
+    task_dir = Path(artifact_dir).resolve() / ("agy-" + uuid.uuid4().hex)
+    task_dir.mkdir(parents=True)
+    stdout_path, stderr_path = task_dir / "stdout.txt", task_dir / "stderr.txt"
+    meta_path = task_dir / "result.json"
+    result.log_path = str(meta_path)
+    command = _prefix(executable) + ["-p", prompt, "--output-format", "json", "--model", model]
+    process = None
+    returncode = None
+    try:
+        # File-backed output preserves partial logs and avoids inherited pipe deadlocks.
+        with stdout_path.open("wb") as out, stderr_path.open("wb") as err:
+            process = subprocess.Popen(command, cwd=str(Path(cwd).resolve()), stdout=out,
+                                       stderr=err, **_spawn_options())
+            result.attempts = 1
+            try:
+                returncode = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                result.status, result.summary = "canceled", f"timed out after {timeout:g}s"
+                result.evidence.append(_stop_tree(process))
+            except KeyboardInterrupt:
+                result.status, result.summary = "canceled", "interrupted by caller"
+                result.evidence.append(_stop_tree(process))
+    except OSError as exc:
+        result.status, result.summary = "error", str(exc)
+    if returncode is not None:
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+        result.evidence.append(f"agy exit code {returncode}; workspace {Path(cwd).resolve()}")
+        if _blocked_diagnostic(stderr):
+            result.status, result.summary = "blocked", stderr.strip()[:2000]
+        elif returncode and _blocked_diagnostic(stdout):
+            result.status, result.summary = "blocked", stdout.strip()[:2000]
+        else:
+            try:
+                envelope = json.loads(stdout)
+                if not isinstance(envelope, dict):
+                    raise ValueError("envelope must be an object")
+                state = envelope.get("status")
+                response = envelope.get("response")
+                if state == "SUCCESS" and returncode == 0 and not envelope.get("error"):
+                    if not isinstance(response, str) or not response.strip():
+                        raise ValueError("successful response must be non-empty text")
+                    result.status = "succeeded"
+                    result.summary = response[:2000] + (" [full response in artifact]" if len(response) > 2000 else "")
+                    result.evidence.append("agent run completed; task acceptance still requires independent proof")
+                else:
+                    detail = str(envelope.get("error") or state or "missing status")
+                    result.status = ("canceled" if state in ("CANCELED", "INTERRUPTED") else
+                                     "blocked" if state == "WAITING" or _blocked_diagnostic(detail) else "error")
+                    result.summary = detail[:2000]
+                if isinstance(envelope.get("usage"), dict):
+                    result.usage = envelope["usage"]
+            except (ValueError, TypeError) as exc:
+                result.status, result.summary = "error", f"invalid agy result: {exc}"
+    meta_path.write_text(json.dumps({
+        "outcome": result.as_dict(), "command": command, "cwd": str(Path(cwd).resolve()),
+        "returncode": returncode, "stdout_path": str(stdout_path), "stderr_path": str(stderr_path),
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return result
 
-    # These are documented headless flags. Model is optional so subscription
-    # selection remains the user's agy account configuration, not an API key.
-    command = [executable, "-p", prompt, "--output-format", "json"]
-    if executable.lower().endswith((".py", ".pyw")):
-        command = [sys.executable, executable, "-p", prompt, "--output-format", "json"]
-    if model:
-        command.extend(["--model", model])
-    workdir = str(cwd) if cwd else None
-    last: Outcome | None = None
-    for attempt in range(retries + 1):
-        started = time.monotonic()
-        try:
-            process = subprocess.run(command, cwd=workdir, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            log_path = _log(Path(artifact_dir), provider, {"command": command, "stdout": exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout, "stderr": exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr, "status": "canceled", "reason": "timeout"})
-            last = Outcome("canceled", provider, model, f"timed out after {timeout:g}s", ["timeout"], log_path, attempts=attempt + 1)
-            break
-        except OSError as exc:
-            last = Outcome("error", provider, model, str(exc), [], attempts=attempt + 1)
-            break
 
-        raw = process.stdout.strip()
-        stderr = process.stderr.strip()
-        log_path = _log(Path(artifact_dir), provider, {"command": command, "stdout": raw, "stderr": stderr, "returncode": process.returncode, "elapsed_seconds": time.monotonic() - started})
-        if process.returncode != 0:
-            text = (stderr or raw or f"agy exited {process.returncode}").lower()
-            status = "blocked" if any(word in text for word in ("authentication", "permission", "denied", "login", "credential")) else "error"
-            last = Outcome(status, provider, model, stderr or raw or "agy failed", [f"exit code {process.returncode}"], log_path, attempts=attempt + 1)
-            if status == "blocked":
-                break
-            continue
-        try:
-            envelope = json.loads(raw)
-        except json.JSONDecodeError:
-            last = Outcome("error", provider, model, "agy returned invalid JSON", ["stdout is not a JSON envelope"], log_path, attempts=attempt + 1)
-            continue
-        if not isinstance(envelope, dict):
-            last = Outcome("error", provider, model, "agy returned a non-object JSON envelope", ["JSON envelope is not an object"], log_path, attempts=attempt + 1)
-            break
-        denial = (stderr or "").lower()
-        if any(word in denial for word in ("permission denied", "approval required", "access denied")):
-            return Outcome("blocked", provider, model, stderr, ["permission enforcement denied the task"], log_path, attempts=attempt + 1)
-        status = str(envelope.get("status", "")).lower()
-        if status != "success":
-            last = Outcome("error", provider, model, envelope.get("error", "agy returned a non-success status"), ["JSON envelope status is not SUCCESS"], log_path, envelope.get("usage"), attempt + 1)
-            continue
-        return Outcome("succeeded", provider, model, envelope.get("response", "").strip(), ["agy JSON envelope status=SUCCESS"], log_path, envelope.get("usage"), attempt + 1)
-    assert last is not None
-    return last
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run one bounded dynamic-workflows provider task")
-    parser.add_argument("command", choices=["capabilities", "run"])
-    parser.add_argument("--provider", choices=["codex-native", "agy"], required=True)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("capabilities", "run"))
+    parser.add_argument("--provider", choices=("codex-native", "agy"), required=True)
     parser.add_argument("--model")
-    parser.add_argument("--prompt")
+    prompts = parser.add_mutually_exclusive_group()
+    prompts.add_argument("--prompt")
+    prompts.add_argument("--prompt-file", type=Path)
     parser.add_argument("--timeout", type=float, default=120)
-    parser.add_argument("--retries", type=int, default=0)
     parser.add_argument("--artifact-dir", default=".workflow-artifacts")
-    parser.add_argument("--cwd")
+    parser.add_argument("--cwd", type=Path)
+    parser.add_argument("--mode", choices=("read-only", "workspace-write"), default="read-only")
     args = parser.parse_args(argv)
     if args.command == "capabilities":
-        print(json.dumps(capabilities(args.provider, args.model), indent=2))
+        print(json.dumps(capabilities(args.provider, args.model)))
         return 0
-    if args.prompt is None:
-        parser.error("--prompt is required for run")
-    result = run_task(provider=args.provider, prompt=args.prompt, model=args.model, timeout=args.timeout, retries=args.retries, artifact_dir=args.artifact_dir, cwd=args.cwd)
-    print(json.dumps(result.as_dict(), indent=2))
-    return 0 if result.status in {"succeeded", "blocked", "canceled"} else 1
+    prompt = args.prompt_file.read_text(encoding="utf-8-sig") if args.prompt_file else args.prompt
+    try:
+        outcome = run_task(provider=args.provider, prompt=prompt, model=args.model,
+                           timeout=args.timeout, artifact_dir=args.artifact_dir, cwd=args.cwd, mode=args.mode)
+    except ValueError as exc:
+        parser.error(str(exc))
+    print(json.dumps(outcome.as_dict(), ensure_ascii=False))
+    return {"succeeded": 0, "blocked": 2, "error": 1, "canceled": 130}[outcome.status]
 
 
 if __name__ == "__main__":
